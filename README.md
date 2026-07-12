@@ -64,6 +64,39 @@ MSYS2's `g++` (ucrt64/mingw64). Pass `-Compiler <path>` to force one.
 > local check is necessary but not sufficient — always test the live mod in
 > Windhawk.
 
+### Taskbar usage bridge
+
+`taskbar-left-text.wh.cpp` can display a UTF-8 bridge file that is refreshed
+from local Claude Code, Codex, and OpenCode logs through
+[ccusage](https://github.com/ccusage/ccusage).
+
+```powershell
+make usage-dry   # preview, don't write
+make usage       # write %USERPROFILE%\.taskbar-usage.txt
+make usage-watch # refresh every 5 minutes until Ctrl+C
+```
+
+The default label is:
+
+```text
+C 5h:0% w:53% | X:29% | O:16%
+```
+
+`C` is Claude Code, `X` is Codex, and `O` is OpenCode. Claude's `5h` value is
+zero while no block is active. The mod reads the bridge file every second and
+only redraws when its contents or the taskbar position changes.
+
+The percentages are **local cost estimates**, not the authoritative quota shown
+by Claude/Codex servers. Set denominators appropriate for your plan:
+
+```powershell
+make usage USAGE_ARGS="-ClaudeBlockLimitUSD 25 -ClaudeWeeklyLimitUSD 100 -CodexWeeklyLimitUSD 50 -OpenCodeWeeklyLimitUSD 50"
+```
+
+Useful updater placeholders are `{claudeBlockPct}`, `{claudeWeeklyPct}`,
+`{codexWeeklyPct}`, `{opencodeWeeklyPct}`, and corresponding `...Cost` values.
+Use `-Format` through `USAGE_ARGS` to customize the label.
+
 ### 2. Editor support
 
 - **VS Code (C/C++ extension):** `.vscode/c_cpp_properties.json` is preconfigured
