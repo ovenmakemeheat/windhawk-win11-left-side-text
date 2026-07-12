@@ -1,0 +1,30 @@
+{
+    "configurations": [
+        {
+            "name": "Windhawk (mingw-x64)",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/.vscode/windhawk_headers_1.7.3"
+            ],
+            "defines": [
+                "WH_MOD",
+                "WH_EDITING",
+                "UNICODE",
+                "_UNICODE",
+                "_WIN32_WINNT=0x0A00",
+                "_WIN64"
+            ],
+            "compilerArgs": [
+                "-std=c++23",
+                "-fno-exceptions",
+                "-fno-rtti",
+                "-include",
+                "windhawk_api.h"
+            ],
+            "intelliSenseMode": "windows-gcc-x64",
+            "cStandard": "c17",
+            "cppStandard": "c++23"
+        }
+    ],
+    "version": 4
+}

@@ -1,0 +1,22 @@
+# Build artifacts
+[Bb]uild/
+[Bb]in/
+[Oo]bj/
+*.o
+*.obj
+*.dll
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Editor / tooling
+.vs/
+.vscode/ipch/
+*.user
+compile_commands.json
+.cache/
+
+# Language toolchains
+__pycache__/
+node_modules/

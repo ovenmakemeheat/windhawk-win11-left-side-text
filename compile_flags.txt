@@ -1,0 +1,17 @@
+-xc++
+-std=c++23
+-DWH_MOD
+-DWH_EDITING
+-target
+x86_64-w64-mingw32
+-DUNICODE
+-D_UNICODE
+-D_WIN32_WINNT=0x0A00
+-I.vscode/windhawk_headers_1.7.3
+-include
+windhawk_api.h
+-Wall
+-Wno-unused-parameter
+-Wno-unused-variable
+-fno-exceptions
+-fno-rtti
