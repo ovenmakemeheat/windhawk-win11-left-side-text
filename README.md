@@ -73,18 +73,48 @@ from local Claude Code, Codex, and OpenCode logs through
 ```powershell
 make usage-dry   # preview, don't write
 make usage       # write %USERPROFILE%\.taskbar-usage.txt
-make usage-watch # refresh every 5 minutes until Ctrl+C
+make usage-watch # fallback foreground refresh loop until Ctrl+C
 ```
 
-The default label is:
+The mod normally updates automatically. Its Windhawk settings default to:
 
 ```text
-C 5h:0% w:53% | X:29% | O:16%
+AutoUpdate: true
+UpdaterScript: %USERPROFILE%\Workspace\Workspace\projects\agents-ctx\Scripts\Update-TaskbarUsage.ps1
+UpdaterArguments: (empty)
+RefreshSeconds: 5
 ```
 
-`C` is Claude Code, `X` is Codex, and `O` is OpenCode. Claude's `5h` value is
+The updater launches as hidden Windows PowerShell, writes to the same
+`UsageFile` configured in the mod, and doesn't block Explorer. Use
+`UpdaterArguments` for limit overrides, for example:
+
+```text
+-ClaudeBlockLimitUSD 25 -ClaudeWeeklyLimitUSD 100 -CodexWeeklyLimitUSD 50 -OpenCodeWeeklyLimitUSD 50
+```
+
+`make usage-watch` remains available if automatic launching is disabled.
+
+The updater writes structured data such as:
+
+```text
+claudeBlockPct=0
+claudeWeeklyPct=53
+codexWeeklyPct=29
+opencodeWeeklyPct=18
+```
+
+The mod's Windhawk **Template** setting controls the visible label. Its default
+is:
+
+```text
+C5 {claudeBlockPct}% | CW {claudeWeeklyPct}% | X {codexWeeklyPct}% | O {opencodeWeeklyPct}%
+```
+
+`C` is Claude Code, `X` is Codex, and `O` is OpenCode. Claude's 5-hour value is
 zero while no block is active. The mod reads the bridge file every second and
-only redraws when its contents or the taskbar position changes.
+only redraws when its contents or the taskbar position changes. Old one-line
+bridge files are still displayed directly.
 
 The percentages are **local cost estimates**, not the authoritative quota shown
 by Claude/Codex servers. Set denominators appropriate for your plan:
@@ -93,9 +123,31 @@ by Claude/Codex servers. Set denominators appropriate for your plan:
 make usage USAGE_ARGS="-ClaudeBlockLimitUSD 25 -ClaudeWeeklyLimitUSD 100 -CodexWeeklyLimitUSD 50 -OpenCodeWeeklyLimitUSD 50"
 ```
 
-Useful updater placeholders are `{claudeBlockPct}`, `{claudeWeeklyPct}`,
-`{codexWeeklyPct}`, `{opencodeWeeklyPct}`, and corresponding `...Cost` values.
-Use `-Format` through `USAGE_ARGS` to customize the label.
+Available Template placeholders are `{claudeBlockPct}`, `{claudeWeeklyPct}`,
+`{codexWeeklyPct}`, `{opencodeWeeklyPct}`, `{claudeBlockCost}`,
+`{claudeWeeklyCost}`, `{codexWeeklyCost}`, `{opencodeWeeklyCost}`, and
+`{updatedAt}`.
+
+The updater also exports current-day, current-month, and latest-session reports
+for `claude`, `codex`, and `opencode`. Build placeholders as:
+
+```text
+{<agent><period><field>}
+```
+
+Periods are `Daily`, `Monthly`, and `Session`. Fields are `Period`,
+`TotalCost`, `TotalTokens`, `InputTokens`, `OutputTokens`,
+`CacheCreationTokens`, `CacheReadTokens`, `ReasoningOutputTokens`, `Models`,
+`ModelBreakdowns`, and `LastActivity`.
+
+Examples:
+
+```text
+Claude today ${claudeDailyTotalCost}
+Codex month ${codexMonthlyTotalCost} / session ${codexSessionTotalCost}
+OpenCode {opencodeDailyTotalTokens} tokens ({opencodeDailyModels})
+Last Codex session: {codexSessionLastActivity}
+```
 
 ### 2. Editor support
 

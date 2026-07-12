@@ -1,15 +1,17 @@
 <#
 .SYNOPSIS
-    Updates the text displayed by the Taskbar Left Text Windhawk mod.
+    Updates usage data consumed by the Taskbar Left Text Windhawk mod.
 
 .DESCRIPTION
-    Reads local Claude Code and Codex logs through ccusage, estimates usage as
-    a percentage of configurable USD limits, and writes a short UTF-8 text file
-    that the mod watches.
+    Reads local Claude Code, Codex, and OpenCode logs through ccusage. It writes
+    a UTF-8 key=value bridge file containing:
 
-    These percentages are local cost estimates, not authoritative account
-    quota values. Claude and Codex don't persist the server-side quota percent
-    locally, so set the limits below to values appropriate for your plan.
+    - Claude 5-hour and all-agent weekly estimates.
+    - Current-day, current-month, and latest-session fields for each agent.
+    - Costs, token counts, model lists, periods, and last-activity timestamps.
+
+    Percentage values are local cost estimates, not authoritative account quota
+    values. Set the USD limits below to values appropriate for your plan.
 
 .EXAMPLE
     .\Scripts\Update-TaskbarUsage.ps1 -DryRun -Verbose
@@ -18,20 +20,17 @@
     .\Scripts\Update-TaskbarUsage.ps1 `
         -ClaudeBlockLimitUSD 25 `
         -ClaudeWeeklyLimitUSD 100 `
-        -CodexWeeklyLimitUSD 50
+        -CodexWeeklyLimitUSD 50 `
+        -OpenCodeWeeklyLimitUSD 50
 #>
 [CmdletBinding()]
 param(
     [string]$OutputFile = "$env:USERPROFILE\.taskbar-usage.txt",
 
-    # Change these estimates to match your plan and preferred denominator.
     [double]$ClaudeBlockLimitUSD = 25.0,
     [double]$ClaudeWeeklyLimitUSD = 100.0,
     [double]$CodexWeeklyLimitUSD = 50.0,
     [double]$OpenCodeWeeklyLimitUSD = 50.0,
-
-    # Available placeholders are documented below where the text is built.
-    [string]$Format = 'C 5h:{claudeBlockPct}% w:{claudeWeeklyPct}% | X:{codexWeeklyPct}% | O:{opencodeWeeklyPct}%',
 
     [switch]$DryRun,
     [switch]$ShowRaw
@@ -47,7 +46,22 @@ function Invoke-CcusageJson {
         $output = & $globalCcusage.Source @CcArgs --json 2>&1 |
             ForEach-Object { $_.ToString() }
     } else {
-        $output = & npx -y ccusage@latest @CcArgs --json 2>&1 |
+        $npx = Get-Command npx -ErrorAction SilentlyContinue
+        if (-not $npx) {
+            $npxCandidates = @(
+                "$env:ProgramFiles\Volta\npx.exe",
+                "$env:APPDATA\npm\npx.cmd"
+            )
+            $npxPath = $npxCandidates |
+                Where-Object { Test-Path -LiteralPath $_ } |
+                Select-Object -First 1
+            if (-not $npxPath) {
+                throw 'Neither ccusage nor npx was found. Install ccusage globally or configure Explorer PATH.'
+            }
+        } else {
+            $npxPath = $npx.Source
+        }
+        $output = & $npxPath -y ccusage@latest @CcArgs --json 2>&1 |
             ForEach-Object { $_.ToString() }
     }
     $exitCode = $LASTEXITCODE
@@ -70,10 +84,99 @@ function ConvertTo-Percent {
     return [math]::Min(100, [math]::Max(0, $pct)).ToString('0')
 }
 
+function Add-ReportEntry {
+    param(
+        [System.Collections.IDictionary]$Values,
+        [string]$Prefix,
+        $Entry
+    )
+
+    $defaults = [ordered]@{
+        Period = '-'
+        TotalCost = '0.00'
+        TotalTokens = '0'
+        InputTokens = '0'
+        OutputTokens = '0'
+        CacheCreationTokens = '0'
+        CacheReadTokens = '0'
+        ReasoningOutputTokens = '0'
+        Models = '-'
+        ModelBreakdowns = '-'
+        LastActivity = '-'
+    }
+    foreach ($field in $defaults.Keys) {
+        $Values["$Prefix$field"] = $defaults[$field]
+    }
+    if ($null -eq $Entry) { return }
+
+    $period = if ($Entry.period) { $Entry.period } else { $Entry.date }
+    if ($period) { $Values["${Prefix}Period"] = [string]$period }
+
+    $cost = if ($null -ne $Entry.totalCost) {
+        [double]$Entry.totalCost
+    } elseif ($null -ne $Entry.costUSD) {
+        [double]$Entry.costUSD
+    } else {
+        0.0
+    }
+    $Values["${Prefix}TotalCost"] = $cost.ToString('0.00')
+
+    foreach ($field in @(
+        'totalTokens',
+        'inputTokens',
+        'outputTokens',
+        'cacheCreationTokens',
+        'cacheReadTokens',
+        'reasoningOutputTokens'
+    )) {
+        if ($null -ne $Entry.$field) {
+            $suffix = $field.Substring(0, 1).ToUpper() + $field.Substring(1)
+            $Values["$Prefix$suffix"] = [string]$Entry.$field
+        }
+    }
+
+    if ($Entry.metadata) {
+        if ($null -ne $Entry.metadata.reasoningOutputTokens) {
+            $Values["${Prefix}ReasoningOutputTokens"] =
+                [string]$Entry.metadata.reasoningOutputTokens
+        }
+        if ($Entry.metadata.lastActivity) {
+            $lastActivity = ([datetime]$Entry.metadata.lastActivity).ToLocalTime()
+            $Values["${Prefix}LastActivity"] =
+                $lastActivity.ToString('yyyy-MM-dd HH:mm')
+        }
+    }
+
+    if ($Entry.modelsUsed) {
+        $Values["${Prefix}Models"] = @($Entry.modelsUsed) -join ','
+    }
+    if ($Entry.modelBreakdowns) {
+        $breakdowns = foreach ($model in @($Entry.modelBreakdowns)) {
+            $modelCost = [double]$model.cost
+            "$($model.modelName):$($modelCost.ToString('0.00'))"
+        }
+        $Values["${Prefix}ModelBreakdowns"] = $breakdowns -join ','
+    }
+}
+
+function Expand-AgentRows {
+    param($Rows)
+
+    foreach ($row in @($Rows)) {
+        if ($row.agents) {
+            foreach ($agentRow in @($row.agents)) {
+                $agentRow | Add-Member -NotePropertyName period `
+                    -NotePropertyValue $row.period -Force
+                $agentRow
+            }
+        } elseif ($row.agent -and $row.agent -ne 'all') {
+            $row
+        }
+    }
+}
+
 $claudeBlockCost = 0.0
-$claudeWeeklyCost = 0.0
-$codexWeeklyCost = 0.0
-$opencodeWeeklyCost = 0.0
+$activityReport = $null
 
 try {
     Write-Verbose 'Reading Claude 5-hour blocks...'
@@ -89,71 +192,86 @@ try {
 }
 
 try {
-    Write-Verbose 'Reading Claude weekly usage...'
-    $weeklyReport = Invoke-CcusageJson @('claude', 'weekly')
-    $currentClaudeWeek = @($weeklyReport.weekly |
-        Sort-Object { [datetime]$_.week })[-1]
-    if ($currentClaudeWeek) {
-        $claudeWeeklyCost = [double]$currentClaudeWeek.totalCost
-    }
+    $monthStart = Get-Date -Day 1 -Format 'yyyy-MM-dd'
+    Write-Verbose "Reading unified reports since $monthStart..."
+    $activityReport = Invoke-CcusageJson @(
+        'daily',
+        '--sections', 'daily,monthly,session',
+        '--by-agent',
+        '--since', $monthStart
+    )
 } catch {
-    Write-Warning "Claude weekly usage unavailable: $_"
+    Write-Warning "Unified usage reports unavailable: $_"
 }
 
-try {
-    Write-Verbose 'Reading Codex daily usage...'
-    $codexReport = Invoke-CcusageJson @('codex', 'daily')
-    $today = (Get-Date).Date
-    $weekStart = $today.AddDays(-[int]$today.DayOfWeek)
-    $currentCodexDays = @($codexReport.daily | Where-Object {
-        $date = [datetime]::ParseExact($_.date, 'yyyy-MM-dd', $null)
-        $date -ge $weekStart -and $date -le $today
-    })
-    if ($currentCodexDays.Count -gt 0) {
-        $codexWeeklyCost = [double](
-            $currentCodexDays | Measure-Object -Property costUSD -Sum
-        ).Sum
+$today = (Get-Date).Date
+$todayText = $today.ToString('yyyy-MM-dd')
+$monthText = $today.ToString('yyyy-MM')
+$weekStart = $today.AddDays(-[int]$today.DayOfWeek)
+
+$agents = @('claude', 'codex', 'opencode')
+$dailyByAgent = @(Expand-AgentRows $activityReport.daily)
+$monthlyByAgent = @(Expand-AgentRows $activityReport.monthly)
+$sessionByAgent = @($activityReport.session)
+$weeklyCosts = @{
+    claude = 0.0
+    codex = 0.0
+    opencode = 0.0
+}
+
+$values = [ordered]@{}
+foreach ($agent in $agents) {
+    $dailyEntries = @($dailyByAgent | Where-Object { $_.agent -eq $agent })
+
+    foreach ($entry in $dailyEntries) {
+        $date = [datetime]::ParseExact($entry.period, 'yyyy-MM-dd', $null)
+        if ($date -ge $weekStart -and $date -le $today) {
+            $weeklyCosts[$agent] += [double]$entry.totalCost
+        }
     }
-} catch {
-    Write-Warning "Codex weekly usage unavailable: $_"
+
+    $dailyEntry = @($dailyEntries |
+        Where-Object { $_.period -eq $todayText })[-1]
+    $monthlyEntry = @($monthlyByAgent |
+        Where-Object { $_.agent -eq $agent -and $_.period -eq $monthText })[-1]
+    $sessionEntry = @($sessionByAgent |
+        Where-Object { $_.agent -eq $agent } |
+        Sort-Object { [datetime]$_.metadata.lastActivity })[-1]
+
+    Add-ReportEntry $values "${agent}Daily" $dailyEntry
+    Add-ReportEntry $values "${agent}Monthly" $monthlyEntry
+    Add-ReportEntry $values "${agent}Session" $sessionEntry
 }
 
-try {
-    Write-Verbose 'Reading OpenCode weekly usage...'
-    $opencodeReport = Invoke-CcusageJson @('opencode', 'weekly')
-    $currentOpenCodeWeek = @($opencodeReport.weekly |
-        Sort-Object { [datetime]$_.week })[-1]
-    if ($currentOpenCodeWeek) {
-        $opencodeWeeklyCost = [double]$currentOpenCodeWeek.totalCost
-    }
-} catch {
-    Write-Warning "OpenCode weekly usage unavailable: $_"
-}
+$values['claudeBlockPct'] =
+    ConvertTo-Percent $claudeBlockCost $ClaudeBlockLimitUSD
+$values['claudeWeeklyPct'] =
+    ConvertTo-Percent $weeklyCosts.claude $ClaudeWeeklyLimitUSD
+$values['codexWeeklyPct'] =
+    ConvertTo-Percent $weeklyCosts.codex $CodexWeeklyLimitUSD
+$values['opencodeWeeklyPct'] =
+    ConvertTo-Percent $weeklyCosts.opencode $OpenCodeWeeklyLimitUSD
+$values['claudeBlockCost'] = $claudeBlockCost.ToString('0.00')
+$values['claudeWeeklyCost'] = $weeklyCosts.claude.ToString('0.00')
+$values['codexWeeklyCost'] = $weeklyCosts.codex.ToString('0.00')
+$values['opencodeWeeklyCost'] = $weeklyCosts.opencode.ToString('0.00')
+$values['updatedAt'] = (Get-Date).ToString('HH:mm')
 
-$values = @{
-    claudeBlockPct = ConvertTo-Percent $claudeBlockCost $ClaudeBlockLimitUSD
-    claudeWeeklyPct = ConvertTo-Percent $claudeWeeklyCost $ClaudeWeeklyLimitUSD
-    codexWeeklyPct = ConvertTo-Percent $codexWeeklyCost $CodexWeeklyLimitUSD
-    opencodeWeeklyPct = ConvertTo-Percent $opencodeWeeklyCost $OpenCodeWeeklyLimitUSD
-    claudeBlockCost = $claudeBlockCost.ToString('0.00')
-    claudeWeeklyCost = $claudeWeeklyCost.ToString('0.00')
-    codexWeeklyCost = $codexWeeklyCost.ToString('0.00')
-    opencodeWeeklyCost = $opencodeWeeklyCost.ToString('0.00')
-}
-
-$text = $Format
-foreach ($key in $values.Keys) {
-    $text = $text.Replace("{$key}", [string]$values[$key])
-}
+$payload = ($values.GetEnumerator() | ForEach-Object {
+    "$($_.Key)=$($_.Value)"
+}) -join "`n"
 
 Write-Verbose (
     'Costs: Claude block=${0:0.00}, Claude week=${1:0.00}, Codex week=${2:0.00}, OpenCode week=${3:0.00}' -f
-    $claudeBlockCost, $claudeWeeklyCost, $codexWeeklyCost, $opencodeWeeklyCost
+    $claudeBlockCost,
+    $weeklyCosts.claude,
+    $weeklyCosts.codex,
+    $weeklyCosts.opencode
 )
 
 if ($DryRun) {
     Write-Host "Would write to: $OutputFile" -ForegroundColor Yellow
-    Write-Host "Content: $text" -ForegroundColor Yellow
+    Write-Host "Data:`n$payload" -ForegroundColor Yellow
     return
 }
 
@@ -163,8 +281,8 @@ if ($parent -and -not (Test-Path -LiteralPath $parent)) {
 }
 [System.IO.File]::WriteAllText(
     $OutputFile,
-    $text,
+    $payload,
     [System.Text.UTF8Encoding]::new($false)
 )
 Write-Host "Updated $OutputFile" -ForegroundColor Green
-Write-Host "Content: $text"
+Write-Host "Data:`n$payload"

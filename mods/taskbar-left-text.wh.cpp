@@ -2,7 +2,7 @@
 // @id              taskbar-left-text
 // @name            Taskbar Left Text
 // @description     Shows custom text on the left side of the taskbar
-// @version         0.3.1
+// @version         0.6.1
 // @author          Your Name
 // @github          https://github.com/your-handle
 // @include         explorer.exe
@@ -20,9 +20,29 @@ It renders a click-through, per-pixel-alpha overlay window owned by the
 taskbar, so the text floats over the taskbar (including the native Windows 11
 XAML taskbar) without blocking clicks.
 
+In usage mode, edit the Template setting to arrange values from the bridge
+file. For example:
+
+`C5 {claudeBlockPct}% | CW {claudeWeeklyPct}% | X {codexWeeklyPct}% | O
+{opencodeWeeklyPct}%`
+
+Daily/monthly/session example:
+
+`X today ${codexDailyTotalCost} | month ${codexMonthlyTotalCost} | session
+${codexSessionTotalCost}`
+
+Remove the `$` signs above if you don't want currency markers. Replace `codex`
+with `claude` or `opencode`. Available field suffixes include `Period`,
+`TotalCost`, `TotalTokens`, `InputTokens`, `OutputTokens`,
+`CacheCreationTokens`, `CacheReadTokens`, `ReasoningOutputTokens`, `Models`,
+`ModelBreakdowns`, and `LastActivity`.
+
 ## Notes
 - Targets `explorer.exe` (the shell that hosts the taskbar).
 - Primary taskbar only (multi-monitor is not supported in this version).
+- AutoUpdate launches the configured PowerShell updater hidden on startup and
+  at the RefreshSeconds interval. It never waits on the Explorer UI thread and
+  won't start another updater while one is running.
 */
 // ==/WindhawkModReadme==
 
@@ -38,6 +58,20 @@ XAML taskbar) without blocking clicks.
 - UsageFile: ""
   $name: Usage file path
   $description: File shown in usage mode. Leave empty for %USERPROFILE%\.taskbar-usage.txt. Environment variables are expanded.
+- AutoUpdate: true
+  $name: Automatically update usage
+  $description: Launch the updater script in a hidden process when the mod starts and at the configured interval
+- UpdaterScript: '%USERPROFILE%\Workspace\Workspace\projects\agents-ctx\Scripts\Update-TaskbarUsage.ps1'
+  $name: Updater script path
+  $description: Absolute path or environment-variable path to Update-TaskbarUsage.ps1
+- UpdaterArguments: ""
+  $name: Updater arguments
+  $description: Optional limit overrides passed to the updater script
+- RefreshSeconds: 5
+  $name: Refresh interval in seconds
+- Template: "C5 {claudeBlockPct}% | CW {claudeWeeklyPct}% | X {codexWeeklyPct}% | O {opencodeWeeklyPct}%"
+  $name: Usage template
+  $description: Customize the label using placeholders from the usage bridge file
 - Text: "★ Taskbar"
   $name: Fallback text
   $description: Shown in text mode, or when the usage file is missing or empty
@@ -66,6 +100,11 @@ XAML taskbar) without blocking clicks.
 
 struct Settings {
     PCWSTR text;
+    PCWSTR templateText;
+    PCWSTR updaterScript;
+    PCWSTR updaterArguments;
+    bool autoUpdate;
+    int refreshSeconds;
     int offsetX;
     int fontSize;
     COLORREF color;
@@ -76,6 +115,8 @@ HWND g_hTaskbar = nullptr;
 HWND g_hwndOverlay = nullptr;
 HFONT g_font = nullptr;
 bool g_classRegistered = false;
+HANDLE g_updaterProcess = nullptr;
+ULONGLONG g_nextUpdateTick = 0;
 
 std::wstring g_lastText;
 RECT g_lastRect = {};
@@ -112,6 +153,11 @@ static COLORREF ParseColor(PCWSTR hex) {
 
 void LoadSettings() {
     g_settings.text = Wh_GetStringSetting(L"Text");
+    g_settings.templateText = Wh_GetStringSetting(L"Template");
+    g_settings.updaterScript = Wh_GetStringSetting(L"UpdaterScript");
+    g_settings.updaterArguments = Wh_GetStringSetting(L"UpdaterArguments");
+    g_settings.autoUpdate = Wh_GetIntSetting(L"AutoUpdate") != 0;
+    g_settings.refreshSeconds = Wh_GetIntSetting(L"RefreshSeconds");
     g_settings.offsetX = Wh_GetIntSetting(L"OffsetX");
     g_settings.fontSize = Wh_GetIntSetting(L"FontSize");
     PCWSTR colorStr = Wh_GetStringSetting(L"Color");
@@ -123,6 +169,18 @@ void FreeSettings() {
     if (g_settings.text) {
         Wh_FreeStringSetting(g_settings.text);
         g_settings.text = nullptr;
+    }
+    if (g_settings.templateText) {
+        Wh_FreeStringSetting(g_settings.templateText);
+        g_settings.templateText = nullptr;
+    }
+    if (g_settings.updaterScript) {
+        Wh_FreeStringSetting(g_settings.updaterScript);
+        g_settings.updaterScript = nullptr;
+    }
+    if (g_settings.updaterArguments) {
+        Wh_FreeStringSetting(g_settings.updaterArguments);
+        g_settings.updaterArguments = nullptr;
     }
 }
 
@@ -186,6 +244,54 @@ std::wstring ReadUsageFile(const std::wstring& path) {
     return out;
 }
 
+std::wstring Trim(std::wstring value) {
+    size_t first = value.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos)
+        return L"";
+    size_t last = value.find_last_not_of(L" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+void ReplaceAll(std::wstring& text,
+                const std::wstring& search,
+                const std::wstring& replacement) {
+    if (search.empty())
+        return;
+    size_t pos = 0;
+    while ((pos = text.find(search, pos)) != std::wstring::npos) {
+        text.replace(pos, search.size(), replacement);
+        pos += replacement.size();
+    }
+}
+
+std::wstring ApplyUsageTemplate(const std::wstring& data) {
+    // Keep accepting the original one-line bridge format.
+    if (data.find(L'=') == std::wstring::npos)
+        return data;
+
+    std::wstring result =
+        g_settings.templateText ? g_settings.templateText : L"";
+    size_t start = 0;
+    while (start <= data.size()) {
+        size_t end = data.find(L'\n', start);
+        std::wstring line =
+            data.substr(start, end == std::wstring::npos ? std::wstring::npos
+                                                         : end - start);
+        size_t equals = line.find(L'=');
+        if (equals != std::wstring::npos) {
+            std::wstring key = Trim(line.substr(0, equals));
+            std::wstring value = Trim(line.substr(equals + 1));
+            if (!key.empty()) {
+                ReplaceAll(result, L"{" + key + L"}", value);
+            }
+        }
+        if (end == std::wstring::npos)
+            break;
+        start = end + 1;
+    }
+    return result;
+}
+
 std::wstring ResolveDisplayText() {
     PCWSTR mode = Wh_GetStringSetting(L"Mode");
     bool usageMode = mode && _wcsicmp(mode, L"usage") == 0;
@@ -193,9 +299,97 @@ std::wstring ResolveDisplayText() {
     if (usageMode) {
         std::wstring v = ReadUsageFile(UsageFilePath());
         if (!v.empty())
-            return v;
+            return ApplyUsageTemplate(v);
     }
     return g_settings.text ? g_settings.text : L"";
+}
+
+std::wstring ExpandEnvironmentPath(PCWSTR value) {
+    if (!value || !*value)
+        return L"";
+    WCHAR expanded[32768];
+    DWORD n = ExpandEnvironmentStringsW(value, expanded, ARRAYSIZE(expanded));
+    if (!n || n > ARRAYSIZE(expanded))
+        return value;
+    return expanded;
+}
+
+void CloseFinishedUpdater() {
+    if (!g_updaterProcess)
+        return;
+    DWORD wait = WaitForSingleObject(g_updaterProcess, 0);
+    if (wait == WAIT_TIMEOUT)
+        return;
+    DWORD exitCode = 0;
+    GetExitCodeProcess(g_updaterProcess, &exitCode);
+    Wh_Log(L"Usage updater finished with exit code %lu", exitCode);
+    CloseHandle(g_updaterProcess);
+    g_updaterProcess = nullptr;
+}
+
+void MaybeRunUpdater(bool force) {
+    CloseFinishedUpdater();
+    if (!g_settings.autoUpdate || g_updaterProcess)
+        return;
+
+    ULONGLONG now = GetTickCount64();
+    if (!force && now < g_nextUpdateTick)
+        return;
+
+    int refreshSeconds =
+        g_settings.refreshSeconds > 0 ? g_settings.refreshSeconds : 5;
+    g_nextUpdateTick = now + (ULONGLONG)refreshSeconds * 1000;
+
+    std::wstring script = ExpandEnvironmentPath(g_settings.updaterScript);
+    DWORD attributes = script.empty() ? INVALID_FILE_ATTRIBUTES
+                                      : GetFileAttributesW(script.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        Wh_Log(L"Updater script not found: %s", script.c_str());
+        g_nextUpdateTick = now + 60 * 1000;
+        return;
+    }
+
+    WCHAR windowsDirectory[MAX_PATH];
+    if (!GetWindowsDirectoryW(windowsDirectory, ARRAYSIZE(windowsDirectory))) {
+        Wh_Log(L"GetWindowsDirectoryW failed: %lu", GetLastError());
+        return;
+    }
+    std::wstring powershell =
+        std::wstring(windowsDirectory) +
+        L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    std::wstring command =
+        L"\"" + powershell + L"\" -NoProfile -ExecutionPolicy Bypass -File \"" +
+        script + L"\" -OutputFile \"" + UsageFilePath() + L"\"";
+    if (g_settings.updaterArguments && *g_settings.updaterArguments) {
+        command += L" ";
+        command += g_settings.updaterArguments;
+    }
+
+    std::wstring workingDirectory;
+    size_t slash = script.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        workingDirectory = script.substr(0, slash);
+
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION process = {};
+    BOOL created = CreateProcessW(
+        powershell.c_str(), command.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr,
+        workingDirectory.empty() ? nullptr : workingDirectory.c_str(), &startup,
+        &process);
+    if (!created) {
+        Wh_Log(L"Failed to launch usage updater: %lu", GetLastError());
+        g_nextUpdateTick = now + 60 * 1000;
+        return;
+    }
+
+    CloseHandle(process.hThread);
+    g_updaterProcess = process.hProcess;
+    Wh_Log(L"Started usage updater, pid=%lu", process.dwProcessId);
 }
 
 void CreateOverlayFont() {
@@ -314,8 +508,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd,
                                 LPARAM lParam) {
     switch (uMsg) {
         case WM_TIMER:
-            if (wParam == TIMER_ID)
+            if (wParam == TIMER_ID) {
+                MaybeRunUpdater(false);
                 UpdateOverlay();
+            }
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -347,6 +543,7 @@ void CreateOverlay() {
            GetLastError());
     if (g_hwndOverlay) {
         SetTimer(g_hwndOverlay, TIMER_ID, 1000, nullptr);
+        MaybeRunUpdater(true);
         UpdateOverlay();
     }
 }
@@ -371,6 +568,8 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
         case WM_TBLT_APPLY:
             CreateOverlayFont();
             g_lastText.clear();  // force re-render even if text is unchanged
+            g_nextUpdateTick = 0;
+            MaybeRunUpdater(true);
             UpdateOverlay();
             return 0;
 
@@ -383,6 +582,10 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
             if (g_font) {
                 DeleteObject(g_font);
                 g_font = nullptr;
+            }
+            if (g_updaterProcess) {
+                CloseHandle(g_updaterProcess);
+                g_updaterProcess = nullptr;
             }
             return 0;
 

@@ -13,7 +13,7 @@ CLANG_FORMAT ?= $(if $(wildcard C:/Users/Gunte/scoop/apps/llvm/current/bin/clang
 PS_SCRIPT    := Scripts\Test-ModCompile.ps1
 USAGE_SCRIPT := Scripts\Update-TaskbarUsage.ps1
 USAGE_ARGS   ?=
-USAGE_INTERVAL ?= 300
+USAGE_INTERVAL ?= 5
 
 .PHONY: help check test format format-check list usage usage-dry usage-watch clean
 
@@ -27,7 +27,7 @@ help: ## Show available targets
 	@echo   make list            List discovered mod files
 	@echo   make usage           Refresh the taskbar usage bridge file
 	@echo   make usage-dry       Preview usage text without writing the file
-	@echo   make usage-watch     Refresh every 5 minutes until Ctrl+C
+	@echo   make usage-watch     Refresh every 5 seconds until Ctrl+C
 	@echo   make clean           Remove generated build artifacts
 	@echo.
 	@echo Detected mods: $(MODS)
