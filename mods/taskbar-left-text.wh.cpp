@@ -2,7 +2,7 @@
 // @id              taskbar-left-text
 // @name            Taskbar Left Text
 // @description     Shows custom text on the left side of the taskbar
-// @version         0.7
+// @version         0.7.2
 // @author          ovenmakemeheat
 // @github          https://github.com/ovenmakemeheat/windhawk-taskbar-ai-usage
 // @include         explorer.exe
@@ -39,7 +39,7 @@ Remove the `$` signs above if you don't want currency markers. Replace `codex`
 with `claude` or `opencode`. Available field suffixes include `Period`,
 `TotalCost`, `TotalTokens`, `InputTokens`, `OutputTokens`,
 `CacheCreationTokens`, `CacheReadTokens`, `ReasoningOutputTokens`, `Models`,
-`ModelBreakdowns`, and `LastActivity`.
+`ModelBreakdowns`, `LastActivity`, and `LastActivityAgo`.
 
 ## Notes
 - Targets `explorer.exe` (the shell that hosts the taskbar).
@@ -86,9 +86,9 @@ with `claude` or `opencode`. Available field suffixes include `Period`,
     - claude: Claude Code
     - opencode: OpenCode
     - agents: All agents
-- PetTemplate: "{pet} {agent}: {state} | {usage}"
+- PetTemplate: "{pet} {agent}: {state}"
   $name: Pet template
-  $description: Compose the pet, selected agent, state text, and formatted usage
+  $description: First line content. Usage is always shown on the second line
 - PetAnimationMs: 500
   $name: Pet animation speed in milliseconds
 - PetStateOverride: auto
@@ -278,7 +278,7 @@ std::wstring ReadUsageFile(const std::wstring& path) {
     DWORD rd = 0;
     while (ReadFile(h, buf, sizeof(buf), &rd, nullptr) && rd > 0) {
         s.append(buf, rd);
-        if (s.size() > 4096)
+        if (s.size() > 65536)
             break;
     }
     CloseHandle(h);
@@ -327,13 +327,11 @@ void ReplaceAll(std::wstring& text,
     }
 }
 
-std::wstring ApplyUsageTemplate(const std::wstring& data) {
-    // Keep accepting the original one-line bridge format.
+std::wstring ApplyBridgePlaceholders(std::wstring result,
+                                     const std::wstring& data) {
     if (data.find(L'=') == std::wstring::npos)
-        return data;
+        return result;
 
-    std::wstring result =
-        g_settings.templateText ? g_settings.templateText : L"";
     size_t start = 0;
     while (start <= data.size()) {
         size_t end = data.find(L'\n', start);
@@ -353,6 +351,16 @@ std::wstring ApplyUsageTemplate(const std::wstring& data) {
         start = end + 1;
     }
     return result;
+}
+
+std::wstring ApplyUsageTemplate(const std::wstring& data) {
+    // Keep accepting the original one-line bridge format.
+    if (data.find(L'=') == std::wstring::npos)
+        return data;
+
+    std::wstring result =
+        g_settings.templateText ? g_settings.templateText : L"";
+    return ApplyBridgePlaceholders(result, data);
 }
 
 std::wstring GetBridgeValue(const std::wstring& data,
@@ -413,10 +421,9 @@ UINT OverlayTimerInterval() {
     return (UINT)animationMs;
 }
 
-std::wstring ApplyPetTemplate(const std::wstring& data,
-                              const std::wstring& usage) {
+std::wstring ResolvePetLine(const std::wstring& data) {
     if (!g_settings.petEnabled)
-        return usage;
+        return L"";
 
     std::wstring agent = g_settings.petAgent ? g_settings.petAgent : L"codex";
     if (agent != L"claude" && agent != L"codex" && agent != L"opencode" &&
@@ -452,25 +459,35 @@ std::wstring ApplyPetTemplate(const std::wstring& data,
     else
         agentText = L"Codex";
 
-    std::wstring result = g_settings.petTemplate
-                              ? g_settings.petTemplate
-                              : L"{pet} {agent}: {state} | {usage}";
+    std::wstring result = g_settings.petTemplate ? g_settings.petTemplate
+                                                 : L"{pet} {agent}: {state}";
     ReplaceAll(result, L"{pet}", PetFrame(state));
     ReplaceAll(result, L"{agent}", agentText);
     ReplaceAll(result, L"{state}", stateText);
-    ReplaceAll(result, L"{usage}", usage);
+
+    // Apply bridge placeholders so they can be used on the pet line too
+    result = ApplyBridgePlaceholders(result, data);
+
+    // Fallback: cleanup {usage} token if user has the old template
+    ReplaceAll(result, L" | {usage}", L"");
+    ReplaceAll(result, L"{usage}", L"");
     return result;
 }
 
-std::wstring ResolveDisplayText() {
-    std::wstring data = ReadUsageFile(UsageFilePath());
+std::wstring ResolveUsageLine(const std::wstring& data) {
     PCWSTR mode = Wh_GetStringSetting(L"Mode");
     bool usageMode = mode && _wcsicmp(mode, L"usage") == 0;
     Wh_FreeStringSetting(mode);
     std::wstring usage = g_settings.text ? g_settings.text : L"";
     if (usageMode && !data.empty())
         usage = ApplyUsageTemplate(data);
-    return ApplyPetTemplate(data, usage);
+    return usage;
+}
+
+void ResolveDisplayLines(std::wstring& line1, std::wstring& line2) {
+    std::wstring data = ReadUsageFile(UsageFilePath());
+    line1 = ResolvePetLine(data);
+    line2 = ResolveUsageLine(data);
 }
 
 std::wstring ExpandEnvironmentPath(PCWSTR value) {
@@ -592,7 +609,15 @@ void UpdateOverlay() {
     if (!g_hwndOverlay || !g_hTaskbar || !g_font)
         return;
 
-    std::wstring disp = ResolveDisplayText();
+    std::wstring line1, line2;
+    ResolveDisplayLines(line1, line2);
+
+    std::wstring lines[2];
+    int lineCount = 0;
+    if (!line1.empty())
+        lines[lineCount++] = line1;
+    if (!line2.empty())
+        lines[lineCount++] = line2;
 
     RECT rcT;
     if (!GetWindowRect(g_hTaskbar, &rcT))
@@ -602,25 +627,36 @@ void UpdateOverlay() {
         return;
 
     // Re-render only when the text or the taskbar rect actually changes.
+    std::wstring disp = line1 + L'\n' + line2;
     if (disp == g_lastText && memcmp(&rcT, &g_lastRect, sizeof(RECT)) == 0) {
         return;
     }
     g_lastText = disp;
     g_lastRect = rcT;
 
-    PCWSTR txt = disp.c_str();
-    int len = (int)disp.size();
-
     HDC screen = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(screen);
     HGDIOBJ oldFont = SelectObject(mem, g_font);
 
-    SIZE textSize = {0, 0};
-    if (len > 0)
-        GetTextExtentPoint32W(mem, txt, len, &textSize);
+    SIZE sizes[2] = {{0, 0}, {0, 0}};
+    int maxWidth = 0;
+    for (int i = 0; i < lineCount; i++) {
+        if (!lines[i].empty())
+            GetTextExtentPoint32W(mem, lines[i].c_str(), (int)lines[i].size(),
+                                  &sizes[i]);
+        if (sizes[i].cx > maxWidth)
+            maxWidth = sizes[i].cx;
+    }
+
+    TEXTMETRICW tm;
+    if (!GetTextMetricsW(mem, &tm))
+        memset(&tm, 0, sizeof(tm));
+    int lineH = tm.tmHeight > 0
+                    ? tm.tmHeight
+                    : (sizes[0].cy > 0 ? sizes[0].cy : g_settings.fontSize);
 
     const int padX = 8;
-    int overlayW = (len > 0 ? textSize.cx : 0) + padX * 2;
+    int overlayW = maxWidth + padX * 2;
     int overlayH = barH;
     if (overlayW < 4)
         overlayW = 4;
@@ -647,8 +683,17 @@ void UpdateOverlay() {
 
     SetTextColor(mem, RGB(255, 255, 255));
     SetBkMode(mem, TRANSPARENT);
-    RECT rcText = {padX, 0, overlayW, overlayH};
-    DrawTextW(mem, txt, len, &rcText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    int blockH = lineCount * lineH;
+    int startY = (overlayH - blockH) / 2;
+    for (int i = 0; i < lineCount; i++) {
+        RECT rcLine;
+        rcLine.left = padX;
+        rcLine.right = overlayW;
+        rcLine.top = startY + i * lineH;
+        rcLine.bottom = startY + (i + 1) * lineH;
+        DrawTextW(mem, lines[i].c_str(), (int)lines[i].size(), &rcLine,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    }
 
     BYTE tr = GetRValue(g_settings.color);
     BYTE tg = GetGValue(g_settings.color);

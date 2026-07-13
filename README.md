@@ -289,6 +289,7 @@ Fields:
 | `Models` | Comma-separated model names. |
 | `ModelBreakdowns` | Comma-separated `model:cost` values. |
 | `LastActivity` | Latest session activity in local time. |
+| `LastActivityAgo` | Relative time since last activity, e.g. `5m ago`, `2h ago`. Refreshes every run. |
 
 If an agent has no activity today, its daily fields contain zeroes and `-`
 placeholders. Monthly fields describe the current month. Session fields describe

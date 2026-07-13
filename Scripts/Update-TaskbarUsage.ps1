@@ -88,6 +88,23 @@ function ConvertTo-Percent {
     return [math]::Min(100, [math]::Max(0, $pct)).ToString('0')
 }
 
+function ConvertTo-TimeAgo {
+    param([long]$Epoch)
+
+    if ($Epoch -le 0) { return '-' }
+    $nowEpoch = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $diff = [math]::Max(0, $nowEpoch - $Epoch)
+    if ($diff -lt 60) { return "${diff}s ago" }
+    $diff = [int]($diff / 60)
+    if ($diff -lt 60) { return "${diff}m ago" }
+    $diff = [int]($diff / 60)
+    if ($diff -lt 24) { return "${diff}h ago" }
+    $diff = [int]($diff / 24)
+    if ($diff -lt 7) { return "${diff}d ago" }
+    $diff = [int]($diff / 7)
+    return "${diff}w ago"
+}
+
 function Add-ReportEntry {
     param(
         [System.Collections.IDictionary]$Values,
@@ -107,6 +124,7 @@ function Add-ReportEntry {
         Models = '-'
         ModelBreakdowns = '-'
         LastActivity = '-'
+        LastActivityAgo = '-'
         LastActivityEpoch = '0'
     }
     foreach ($field in $defaults.Keys) {
@@ -471,6 +489,16 @@ Add-AgentStates $values $processes $nowEpoch `
     ([math]::Max(1, $WorkingThresholdSeconds)) `
     ([math]::Max($WorkingThresholdSeconds + 1, $BlockedThresholdSeconds))
 $values['updatedAt'] = $now.ToString('HH:mm:ss')
+
+# Recompute relative "time ago" for every stored activity epoch so it stays
+# fresh on cached (state-only) refreshes too.
+foreach ($key in @($values.Keys)) {
+    if ($key -match '^(.*)LastActivityEpoch$') {
+        $prefix = $matches[1]
+        $epoch = [long]$values[$key]
+        $values["${prefix}LastActivityAgo"] = ConvertTo-TimeAgo $epoch
+    }
+}
 
 $payload = ($values.GetEnumerator() | ForEach-Object {
     "$($_.Key)=$($_.Value)"
