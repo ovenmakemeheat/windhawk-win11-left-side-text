@@ -32,6 +32,10 @@ param(
     [double]$CodexWeeklyLimitUSD = 50.0,
     [double]$OpenCodeWeeklyLimitUSD = 50.0,
 
+    [int]$FullRefreshSeconds = 60,
+    [int]$WorkingThresholdSeconds = 15,
+    [int]$BlockedThresholdSeconds = 60,
+
     [switch]$DryRun,
     [switch]$ShowRaw
 )
@@ -84,6 +88,23 @@ function ConvertTo-Percent {
     return [math]::Min(100, [math]::Max(0, $pct)).ToString('0')
 }
 
+function ConvertTo-TimeAgo {
+    param([long]$Epoch)
+
+    if ($Epoch -le 0) { return '-' }
+    $nowEpoch = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $diff = [math]::Max(0, $nowEpoch - $Epoch)
+    if ($diff -lt 60) { return "${diff}s ago" }
+    $diff = [int]($diff / 60)
+    if ($diff -lt 60) { return "${diff}m ago" }
+    $diff = [int]($diff / 60)
+    if ($diff -lt 24) { return "${diff}h ago" }
+    $diff = [int]($diff / 24)
+    if ($diff -lt 7) { return "${diff}d ago" }
+    $diff = [int]($diff / 7)
+    return "${diff}w ago"
+}
+
 function Add-ReportEntry {
     param(
         [System.Collections.IDictionary]$Values,
@@ -103,6 +124,8 @@ function Add-ReportEntry {
         Models = '-'
         ModelBreakdowns = '-'
         LastActivity = '-'
+        LastActivityAgo = '-'
+        LastActivityEpoch = '0'
     }
     foreach ($field in $defaults.Keys) {
         $Values["$Prefix$field"] = $defaults[$field]
@@ -144,6 +167,8 @@ function Add-ReportEntry {
             $lastActivity = ([datetime]$Entry.metadata.lastActivity).ToLocalTime()
             $Values["${Prefix}LastActivity"] =
                 $lastActivity.ToString('yyyy-MM-dd HH:mm')
+            $Values["${Prefix}LastActivityEpoch"] =
+                ([DateTimeOffset]$lastActivity).ToUnixTimeSeconds().ToString()
         }
     }
 
@@ -175,99 +200,309 @@ function Expand-AgentRows {
     }
 }
 
-$claudeBlockCost = 0.0
-$activityReport = $null
+function Read-BridgeValues {
+    param([string]$Path)
 
-try {
-    Write-Verbose 'Reading Claude 5-hour blocks...'
-    $blockReport = Invoke-CcusageJson @('blocks')
-    $activeBlock = @($blockReport.blocks |
-        Where-Object { $_.isActive -and -not $_.isGap } |
-        Sort-Object { [datetime]$_.startTime })[-1]
-    if ($activeBlock) {
-        $claudeBlockCost = [double]$activeBlock.costUSD
+    $result = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $result
     }
-} catch {
-    Write-Warning "Claude block usage unavailable: $_"
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $equals = $line.IndexOf('=')
+        if ($equals -le 0) { continue }
+        $key = $line.Substring(0, $equals).Trim()
+        $value = $line.Substring($equals + 1).Trim()
+        if ($key) { $result[$key] = $value }
+    }
+    return $result
 }
 
-try {
-    $monthStart = Get-Date -Day 1 -Format 'yyyy-MM-dd'
-    Write-Verbose "Reading unified reports since $monthStart..."
-    $activityReport = Invoke-CcusageJson @(
-        'daily',
-        '--sections', 'daily,monthly,session',
-        '--by-agent',
-        '--since', $monthStart
-    )
-} catch {
-    Write-Warning "Unified usage reports unavailable: $_"
-}
+function Get-AgentProcesses {
+    $result = @{
+        claude = @{ Running = $false; CpuTicks = [uint64]0 }
+        codex = @{ Running = $false; CpuTicks = [uint64]0 }
+        opencode = @{ Running = $false; CpuTicks = [uint64]0 }
+    }
 
-$today = (Get-Date).Date
-$todayText = $today.ToString('yyyy-MM-dd')
-$monthText = $today.ToString('yyyy-MM')
-$weekStart = $today.AddDays(-[int]$today.DayOfWeek)
+    try {
+        $processes = Get-CimInstance Win32_Process -Property Name, CommandLine, KernelModeTime, UserModeTime
+        foreach ($process in $processes) {
+            $name = ([string]$process.Name).ToLowerInvariant()
+            $command = ([string]$process.CommandLine).ToLowerInvariant()
+            $text = "$name $command"
+            $agent = $null
 
-$agents = @('claude', 'codex', 'opencode')
-$dailyByAgent = @(Expand-AgentRows $activityReport.daily)
-$monthlyByAgent = @(Expand-AgentRows $activityReport.monthly)
-$sessionByAgent = @($activityReport.session)
-$weeklyCosts = @{
-    claude = 0.0
-    codex = 0.0
-    opencode = 0.0
-}
+            if ($name -eq 'claude.exe' -or
+                $text -match '@anthropic-ai[\\/]claude-code' -or
+                $text -match '(^|[\\/\s])claude(?:\.exe|\.cmd|\.js)?(?:\s|$)') {
+                $agent = 'claude'
+            } elseif ($name -eq 'codex.exe' -or
+                      $text -match '@openai[\\/]codex' -or
+                      $text -match '(^|[\\/\s])codex(?:\.exe|\.cmd|\.js)?(?:\s|$)') {
+                $agent = 'codex'
+            } elseif ($name -eq 'opencode.exe' -or
+                      $text -match '(^|[\\/\s])opencode(?:\.exe|\.cmd|\.js)?(?:\s|$)') {
+                $agent = 'opencode'
+            }
 
-$values = [ordered]@{}
-foreach ($agent in $agents) {
-    $dailyEntries = @($dailyByAgent | Where-Object { $_.agent -eq $agent })
-
-    foreach ($entry in $dailyEntries) {
-        $date = [datetime]::ParseExact($entry.period, 'yyyy-MM-dd', $null)
-        if ($date -ge $weekStart -and $date -le $today) {
-            $weeklyCosts[$agent] += [double]$entry.totalCost
+            if ($agent) {
+                $result[$agent].Running = $true
+                $kernel = if ($null -ne $process.KernelModeTime) {
+                    [uint64]$process.KernelModeTime
+                } else { [uint64]0 }
+                $user = if ($null -ne $process.UserModeTime) {
+                    [uint64]$process.UserModeTime
+                } else { [uint64]0 }
+                $result[$agent].CpuTicks += $kernel + $user
+            }
+        }
+    } catch {
+        Write-Warning "Process state detection failed: $_"
+        foreach ($agent in @('claude', 'codex', 'opencode')) {
+            if (Get-Process -Name $agent -ErrorAction SilentlyContinue) {
+                $result[$agent].Running = $true
+            }
         }
     }
 
-    $dailyEntry = @($dailyEntries |
-        Where-Object { $_.period -eq $todayText })[-1]
-    $monthlyEntry = @($monthlyByAgent |
-        Where-Object { $_.agent -eq $agent -and $_.period -eq $monthText })[-1]
-    $sessionEntry = @($sessionByAgent |
-        Where-Object { $_.agent -eq $agent } |
-        Sort-Object { [datetime]$_.metadata.lastActivity })[-1]
-
-    Add-ReportEntry $values "${agent}Daily" $dailyEntry
-    Add-ReportEntry $values "${agent}Monthly" $monthlyEntry
-    Add-ReportEntry $values "${agent}Session" $sessionEntry
+    return $result
 }
 
-$values['claudeBlockPct'] =
-    ConvertTo-Percent $claudeBlockCost $ClaudeBlockLimitUSD
-$values['claudeWeeklyPct'] =
-    ConvertTo-Percent $weeklyCosts.claude $ClaudeWeeklyLimitUSD
-$values['codexWeeklyPct'] =
-    ConvertTo-Percent $weeklyCosts.codex $CodexWeeklyLimitUSD
-$values['opencodeWeeklyPct'] =
-    ConvertTo-Percent $weeklyCosts.opencode $OpenCodeWeeklyLimitUSD
-$values['claudeBlockCost'] = $claudeBlockCost.ToString('0.00')
-$values['claudeWeeklyCost'] = $weeklyCosts.claude.ToString('0.00')
-$values['codexWeeklyCost'] = $weeklyCosts.codex.ToString('0.00')
-$values['opencodeWeeklyCost'] = $weeklyCosts.opencode.ToString('0.00')
-$values['updatedAt'] = (Get-Date).ToString('HH:mm')
+function Add-AgentStates {
+    param(
+        [System.Collections.IDictionary]$Values,
+        [hashtable]$Processes,
+        [long]$NowEpoch,
+        [int]$WorkingSeconds,
+        [int]$BlockedSeconds
+    )
+
+    $states = @{}
+    foreach ($agent in @('claude', 'codex', 'opencode')) {
+        $running = [bool]$Processes[$agent].Running
+        $cpuTicks = [uint64]$Processes[$agent].CpuTicks
+        $previousCpu = if ($Values.Contains("${agent}CpuTicks")) {
+            [uint64]$Values["${agent}CpuTicks"]
+        } else { [uint64]0 }
+        $lastProgress = if ($Values.Contains("${agent}LastProgressEpoch")) {
+            [long]$Values["${agent}LastProgressEpoch"]
+        } else { [long]0 }
+        $sessionActivity = if ($Values.Contains("${agent}SessionLastActivityEpoch")) {
+            [long]$Values["${agent}SessionLastActivityEpoch"]
+        } else { [long]0 }
+
+        if ($sessionActivity -gt $lastProgress) {
+            $lastProgress = $sessionActivity
+        }
+        if ($running -and ($previousCpu -eq 0 -or $cpuTicks -gt $previousCpu)) {
+            $lastProgress = $NowEpoch
+        }
+
+        $age = if ($lastProgress -gt 0) {
+            [math]::Max(0, $NowEpoch - $lastProgress)
+        } else { -1 }
+
+        if (($age -ge 0 -and $age -le $WorkingSeconds)) {
+            $state = 'working'
+        } elseif ($running -and $age -ge $BlockedSeconds) {
+            $state = 'blocked'
+        } else {
+            $state = 'idle'
+        }
+
+        $Values["${agent}State"] = $state
+        $Values["${agent}StateText"] =
+            $state.Substring(0, 1).ToUpper() + $state.Substring(1)
+        $Values["${agent}ProcessRunning"] = $running.ToString().ToLowerInvariant()
+        $Values["${agent}ActivityAgeSeconds"] = [string]$age
+        $Values["${agent}CpuTicks"] = [string]$cpuTicks
+        $Values["${agent}LastProgressEpoch"] = [string]$lastProgress
+        $states[$agent] = @{ State = $state; Age = $age }
+    }
+
+    $blocked = @($states.GetEnumerator() | Where-Object { $_.Value.State -eq 'blocked' })
+    $working = @($states.GetEnumerator() | Where-Object { $_.Value.State -eq 'working' })
+    if ($blocked.Count -gt 0) {
+        $aggregate = 'blocked'
+        $candidates = $blocked
+    } elseif ($working.Count -gt 0) {
+        $aggregate = 'working'
+        $candidates = $working
+    } else {
+        $aggregate = 'idle'
+        $candidates = @($states.GetEnumerator())
+    }
+    $active = $candidates | Sort-Object { if ($_.Value.Age -lt 0) { [long]::MaxValue } else { $_.Value.Age } } | Select-Object -First 1
+
+    $Values['agentsState'] = $aggregate
+    $Values['agentsStateText'] =
+        $aggregate.Substring(0, 1).ToUpper() + $aggregate.Substring(1)
+    $Values['activeAgent'] = if ($active) { $active.Key } else { 'agents' }
+    $Values['agentsWorkingCount'] = [string]$working.Count
+    $Values['agentsBlockedCount'] = [string]$blocked.Count
+}
+
+function Write-BridgeAtomic {
+    param([string]$Path, [string]$Content)
+
+    $parent = Split-Path $Path -Parent
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $temp = "$Path.tmp.$PID"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temp,
+            $Content,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($temp, $Path, $null)
+        } else {
+            [System.IO.File]::Move($temp, $Path)
+        }
+    } catch {
+        if (Test-Path -LiteralPath $temp) {
+            Move-Item -LiteralPath $temp -Destination $Path -Force
+        } else {
+            throw
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temp) {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+$values = Read-BridgeValues $OutputFile
+$now = [DateTimeOffset]::Now
+$nowEpoch = $now.ToUnixTimeSeconds()
+$lastUsageEpoch = if ($values.Contains('usageUpdatedEpoch')) {
+    [long]$values['usageUpdatedEpoch']
+} else { [long]0 }
+$fullRefreshDue = $DryRun -or $lastUsageEpoch -le 0 -or
+    ($nowEpoch - $lastUsageEpoch) -ge [math]::Max(1, $FullRefreshSeconds)
+
+if ($fullRefreshDue) {
+    $claudeBlockCost = 0.0
+    $activityReport = $null
+
+    try {
+        Write-Verbose 'Reading Claude 5-hour blocks...'
+        $blockReport = Invoke-CcusageJson @('blocks')
+        $activeBlock = @($blockReport.blocks |
+            Where-Object { $_.isActive -and -not $_.isGap } |
+            Sort-Object { [datetime]$_.startTime })[-1]
+        if ($activeBlock) {
+            $claudeBlockCost = [double]$activeBlock.costUSD
+        }
+    } catch {
+        Write-Warning "Claude block usage unavailable: $_"
+    }
+
+    try {
+        $monthStart = Get-Date -Day 1 -Format 'yyyy-MM-dd'
+        Write-Verbose "Reading unified reports since $monthStart..."
+        $activityReport = Invoke-CcusageJson @(
+            'daily',
+            '--sections', 'daily,monthly,session',
+            '--by-agent',
+            '--since', $monthStart
+        )
+    } catch {
+        Write-Warning "Unified usage reports unavailable: $_"
+    }
+
+    if ($activityReport) {
+        $today = (Get-Date).Date
+        $todayText = $today.ToString('yyyy-MM-dd')
+        $monthText = $today.ToString('yyyy-MM')
+        $weekStart = $today.AddDays(-[int]$today.DayOfWeek)
+        $agents = @('claude', 'codex', 'opencode')
+        $dailyByAgent = @(Expand-AgentRows $activityReport.daily)
+        $monthlyByAgent = @(Expand-AgentRows $activityReport.monthly)
+        $sessionByAgent = @($activityReport.session)
+        $weeklyCosts = @{
+            claude = 0.0
+            codex = 0.0
+            opencode = 0.0
+        }
+
+        foreach ($agent in $agents) {
+            $dailyEntries = @($dailyByAgent |
+                Where-Object { $_.agent -eq $agent })
+            foreach ($entry in $dailyEntries) {
+                $date = [datetime]::ParseExact(
+                    $entry.period,
+                    'yyyy-MM-dd',
+                    $null
+                )
+                if ($date -ge $weekStart -and $date -le $today) {
+                    $weeklyCosts[$agent] += [double]$entry.totalCost
+                }
+            }
+
+            $dailyEntry = @($dailyEntries |
+                Where-Object { $_.period -eq $todayText })[-1]
+            $monthlyEntry = @($monthlyByAgent |
+                Where-Object {
+                    $_.agent -eq $agent -and $_.period -eq $monthText
+                })[-1]
+            $sessionEntry = @($sessionByAgent |
+                Where-Object { $_.agent -eq $agent } |
+                Sort-Object { [datetime]$_.metadata.lastActivity })[-1]
+
+            Add-ReportEntry $values "${agent}Daily" $dailyEntry
+            Add-ReportEntry $values "${agent}Monthly" $monthlyEntry
+            Add-ReportEntry $values "${agent}Session" $sessionEntry
+        }
+
+        $values['claudeBlockPct'] =
+            ConvertTo-Percent $claudeBlockCost $ClaudeBlockLimitUSD
+        $values['claudeWeeklyPct'] =
+            ConvertTo-Percent $weeklyCosts.claude $ClaudeWeeklyLimitUSD
+        $values['codexWeeklyPct'] =
+            ConvertTo-Percent $weeklyCosts.codex $CodexWeeklyLimitUSD
+        $values['opencodeWeeklyPct'] =
+            ConvertTo-Percent $weeklyCosts.opencode $OpenCodeWeeklyLimitUSD
+        $values['claudeBlockCost'] = $claudeBlockCost.ToString('0.00')
+        $values['claudeWeeklyCost'] = $weeklyCosts.claude.ToString('0.00')
+        $values['codexWeeklyCost'] = $weeklyCosts.codex.ToString('0.00')
+        $values['opencodeWeeklyCost'] = $weeklyCosts.opencode.ToString('0.00')
+        $values['usageUpdatedEpoch'] = [string]$nowEpoch
+        $values['usageUpdatedAt'] = $now.ToString('HH:mm:ss')
+
+        Write-Verbose (
+            'Costs: Claude block=${0:0.00}, Claude week=${1:0.00}, Codex week=${2:0.00}, OpenCode week=${3:0.00}' -f
+            $claudeBlockCost,
+            $weeklyCosts.claude,
+            $weeklyCosts.codex,
+            $weeklyCosts.opencode
+        )
+    }
+} else {
+    Write-Verbose 'Reusing cached ccusage report values.'
+}
+
+$processes = Get-AgentProcesses
+Add-AgentStates $values $processes $nowEpoch `
+    ([math]::Max(1, $WorkingThresholdSeconds)) `
+    ([math]::Max($WorkingThresholdSeconds + 1, $BlockedThresholdSeconds))
+$values['updatedAt'] = $now.ToString('HH:mm:ss')
+
+# Recompute relative "time ago" for every stored activity epoch so it stays
+# fresh on cached (state-only) refreshes too.
+foreach ($key in @($values.Keys)) {
+    if ($key -match '^(.*)LastActivityEpoch$') {
+        $prefix = $matches[1]
+        $epoch = [long]$values[$key]
+        $values["${prefix}LastActivityAgo"] = ConvertTo-TimeAgo $epoch
+    }
+}
 
 $payload = ($values.GetEnumerator() | ForEach-Object {
     "$($_.Key)=$($_.Value)"
 }) -join "`n"
-
-Write-Verbose (
-    'Costs: Claude block=${0:0.00}, Claude week=${1:0.00}, Codex week=${2:0.00}, OpenCode week=${3:0.00}' -f
-    $claudeBlockCost,
-    $weeklyCosts.claude,
-    $weeklyCosts.codex,
-    $weeklyCosts.opencode
-)
 
 if ($DryRun) {
     Write-Host "Would write to: $OutputFile" -ForegroundColor Yellow
@@ -275,14 +510,14 @@ if ($DryRun) {
     return
 }
 
-$parent = Split-Path $OutputFile -Parent
-if ($parent -and -not (Test-Path -LiteralPath $parent)) {
-    New-Item -ItemType Directory -Path $parent -Force | Out-Null
-}
-[System.IO.File]::WriteAllText(
-    $OutputFile,
-    $payload,
-    [System.Text.UTF8Encoding]::new($false)
-)
+Write-BridgeAtomic $OutputFile $payload
 Write-Host "Updated $OutputFile" -ForegroundColor Green
-Write-Host "Data:`n$payload"
+Write-Host "Usage report: $(if ($fullRefreshDue) { 'refreshed' } else { 'cached' })"
+Write-Host (
+    'States: Claude={0}, Codex={1}, OpenCode={2}, Agents={3}' -f
+    $values['claudeState'],
+    $values['codexState'],
+    $values['opencodeState'],
+    $values['agentsState']
+)
+Write-Verbose "Data:`n$payload"

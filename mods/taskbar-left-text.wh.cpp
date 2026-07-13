@@ -2,9 +2,9 @@
 // @id              taskbar-left-text
 // @name            Taskbar Left Text
 // @description     Shows custom text on the left side of the taskbar
-// @version         0.6.1
-// @author          Your Name
-// @github          https://github.com/your-handle
+// @version         0.7.2
+// @author          ovenmakemeheat
+// @github          https://github.com/ovenmakemeheat/windhawk-taskbar-ai-usage
 // @include         explorer.exe
 // @compilerOptions -lcomctl32 -lgdi32
 // @license         MIT
@@ -19,6 +19,10 @@ Shows configurable text on the left side of the Windows taskbar.
 It renders a click-through, per-pixel-alpha overlay window owned by the
 taskbar, so the text floats over the taskbar (including the native Windows 11
 XAML taskbar) without blocking clicks.
+
+An animated ASCII cat can track Codex, Claude Code, OpenCode, or all agents.
+State detection uses process presence, CPU progress, and latest local session
+activity without reading prompt contents.
 
 In usage mode, edit the Template setting to arrange values from the bridge
 file. For example:
@@ -35,7 +39,7 @@ Remove the `$` signs above if you don't want currency markers. Replace `codex`
 with `claude` or `opencode`. Available field suffixes include `Period`,
 `TotalCost`, `TotalTokens`, `InputTokens`, `OutputTokens`,
 `CacheCreationTokens`, `CacheReadTokens`, `ReasoningOutputTokens`, `Models`,
-`ModelBreakdowns`, and `LastActivity`.
+`ModelBreakdowns`, `LastActivity`, and `LastActivityAgo`.
 
 ## Notes
 - Targets `explorer.exe` (the shell that hosts the taskbar).
@@ -72,6 +76,35 @@ with `claude` or `opencode`. Available field suffixes include `Period`,
 - Template: "C5 {claudeBlockPct}% | CW {claudeWeeklyPct}% | X {codexWeeklyPct}% | O {opencodeWeeklyPct}%"
   $name: Usage template
   $description: Customize the label using placeholders from the usage bridge file
+- PetEnabled: true
+  $name: Show animated pet
+- PetAgent: codex
+  $name: Pet agent
+  $description: Select which agent drives the pet, or agents for an aggregate state
+  $options:
+    - codex: Codex
+    - claude: Claude Code
+    - opencode: OpenCode
+    - agents: All agents
+- PetTemplate: "{pet} {agent}: {state}"
+  $name: Pet template
+  $description: First line content. Usage is always shown on the second line
+- PetAnimationMs: 500
+  $name: Pet animation speed in milliseconds
+- PetStateOverride: auto
+  $name: Pet state override
+  $description: Force a state to test animation frames
+  $options:
+    - auto: Automatic detection
+    - working: Working
+    - idle: Idle
+    - blocked: Blocked
+- WorkingThresholdSeconds: 15
+  $name: Working activity threshold in seconds
+- BlockedThresholdSeconds: 60
+  $name: Blocked inactivity threshold in seconds
+- UsageRefreshSeconds: 60
+  $name: Full ccusage refresh interval in seconds
 - Text: "★ Taskbar"
   $name: Fallback text
   $description: Shown in text mode, or when the usage file is missing or empty
@@ -103,8 +136,16 @@ struct Settings {
     PCWSTR templateText;
     PCWSTR updaterScript;
     PCWSTR updaterArguments;
+    PCWSTR petAgent;
+    PCWSTR petTemplate;
+    PCWSTR petStateOverride;
     bool autoUpdate;
+    bool petEnabled;
     int refreshSeconds;
+    int petAnimationMs;
+    int workingThresholdSeconds;
+    int blockedThresholdSeconds;
+    int usageRefreshSeconds;
     int offsetX;
     int fontSize;
     COLORREF color;
@@ -156,8 +197,18 @@ void LoadSettings() {
     g_settings.templateText = Wh_GetStringSetting(L"Template");
     g_settings.updaterScript = Wh_GetStringSetting(L"UpdaterScript");
     g_settings.updaterArguments = Wh_GetStringSetting(L"UpdaterArguments");
+    g_settings.petAgent = Wh_GetStringSetting(L"PetAgent");
+    g_settings.petTemplate = Wh_GetStringSetting(L"PetTemplate");
+    g_settings.petStateOverride = Wh_GetStringSetting(L"PetStateOverride");
     g_settings.autoUpdate = Wh_GetIntSetting(L"AutoUpdate") != 0;
+    g_settings.petEnabled = Wh_GetIntSetting(L"PetEnabled") != 0;
     g_settings.refreshSeconds = Wh_GetIntSetting(L"RefreshSeconds");
+    g_settings.petAnimationMs = Wh_GetIntSetting(L"PetAnimationMs");
+    g_settings.workingThresholdSeconds =
+        Wh_GetIntSetting(L"WorkingThresholdSeconds");
+    g_settings.blockedThresholdSeconds =
+        Wh_GetIntSetting(L"BlockedThresholdSeconds");
+    g_settings.usageRefreshSeconds = Wh_GetIntSetting(L"UsageRefreshSeconds");
     g_settings.offsetX = Wh_GetIntSetting(L"OffsetX");
     g_settings.fontSize = Wh_GetIntSetting(L"FontSize");
     PCWSTR colorStr = Wh_GetStringSetting(L"Color");
@@ -181,6 +232,18 @@ void FreeSettings() {
     if (g_settings.updaterArguments) {
         Wh_FreeStringSetting(g_settings.updaterArguments);
         g_settings.updaterArguments = nullptr;
+    }
+    if (g_settings.petAgent) {
+        Wh_FreeStringSetting(g_settings.petAgent);
+        g_settings.petAgent = nullptr;
+    }
+    if (g_settings.petTemplate) {
+        Wh_FreeStringSetting(g_settings.petTemplate);
+        g_settings.petTemplate = nullptr;
+    }
+    if (g_settings.petStateOverride) {
+        Wh_FreeStringSetting(g_settings.petStateOverride);
+        g_settings.petStateOverride = nullptr;
     }
 }
 
@@ -215,7 +278,7 @@ std::wstring ReadUsageFile(const std::wstring& path) {
     DWORD rd = 0;
     while (ReadFile(h, buf, sizeof(buf), &rd, nullptr) && rd > 0) {
         s.append(buf, rd);
-        if (s.size() > 4096)
+        if (s.size() > 65536)
             break;
     }
     CloseHandle(h);
@@ -264,13 +327,11 @@ void ReplaceAll(std::wstring& text,
     }
 }
 
-std::wstring ApplyUsageTemplate(const std::wstring& data) {
-    // Keep accepting the original one-line bridge format.
+std::wstring ApplyBridgePlaceholders(std::wstring result,
+                                     const std::wstring& data) {
     if (data.find(L'=') == std::wstring::npos)
-        return data;
+        return result;
 
-    std::wstring result =
-        g_settings.templateText ? g_settings.templateText : L"";
     size_t start = 0;
     while (start <= data.size()) {
         size_t end = data.find(L'\n', start);
@@ -292,16 +353,141 @@ std::wstring ApplyUsageTemplate(const std::wstring& data) {
     return result;
 }
 
-std::wstring ResolveDisplayText() {
+std::wstring ApplyUsageTemplate(const std::wstring& data) {
+    // Keep accepting the original one-line bridge format.
+    if (data.find(L'=') == std::wstring::npos)
+        return data;
+
+    std::wstring result =
+        g_settings.templateText ? g_settings.templateText : L"";
+    return ApplyBridgePlaceholders(result, data);
+}
+
+std::wstring GetBridgeValue(const std::wstring& data,
+                            const std::wstring& wantedKey) {
+    size_t start = 0;
+    while (start <= data.size()) {
+        size_t end = data.find(L'\n', start);
+        std::wstring line =
+            data.substr(start, end == std::wstring::npos ? std::wstring::npos
+                                                         : end - start);
+        size_t equals = line.find(L'=');
+        if (equals != std::wstring::npos &&
+            Trim(line.substr(0, equals)) == wantedKey) {
+            return Trim(line.substr(equals + 1));
+        }
+        if (end == std::wstring::npos)
+            break;
+        start = end + 1;
+    }
+    return L"";
+}
+
+std::wstring StateText(const std::wstring& state) {
+    if (state.empty())
+        return L"Idle";
+    std::wstring result = state;
+    if (result[0] >= L'a' && result[0] <= L'z')
+        result[0] -= L'a' - L'A';
+    return result;
+}
+
+std::wstring PetFrame(const std::wstring& state) {
+    PCWSTR frame0;
+    PCWSTR frame1;
+    if (state == L"working") {
+        frame0 = L"(=^.^=)>";
+        frame1 = L"(=^o^=)>";
+    } else if (state == L"blocked") {
+        frame0 = L"(=x.x=)!";
+        frame1 = L"(=o.o=)?";
+    } else {
+        frame0 = L"(=-.-=)z";
+        frame1 = L"(=-.-=)Z";
+    }
+    int animationMs =
+        g_settings.petAnimationMs >= 100 ? g_settings.petAnimationMs : 500;
+    return ((GetTickCount64() / animationMs) % 2) ? frame1 : frame0;
+}
+
+UINT OverlayTimerInterval() {
+    if (!g_settings.petEnabled)
+        return 1000;
+    int animationMs = g_settings.petAnimationMs;
+    if (animationMs < 100)
+        animationMs = 100;
+    if (animationMs > 5000)
+        animationMs = 5000;
+    return (UINT)animationMs;
+}
+
+std::wstring ResolvePetLine(const std::wstring& data) {
+    if (!g_settings.petEnabled)
+        return L"";
+
+    std::wstring agent = g_settings.petAgent ? g_settings.petAgent : L"codex";
+    if (agent != L"claude" && agent != L"codex" && agent != L"opencode" &&
+        agent != L"agents") {
+        agent = L"codex";
+    }
+
+    std::wstring stateKey =
+        agent == L"agents" ? L"agentsState" : agent + L"State";
+    std::wstring stateTextKey =
+        agent == L"agents" ? L"agentsStateText" : agent + L"StateText";
+    std::wstring state = GetBridgeValue(data, stateKey);
+    std::wstring overrideState =
+        g_settings.petStateOverride ? g_settings.petStateOverride : L"auto";
+    if (overrideState == L"working" || overrideState == L"idle" ||
+        overrideState == L"blocked") {
+        state = overrideState;
+    }
+    if (state != L"working" && state != L"blocked")
+        state = L"idle";
+
+    std::wstring stateText = GetBridgeValue(data, stateTextKey);
+    if (overrideState != L"auto" || stateText.empty())
+        stateText = StateText(state);
+
+    std::wstring agentText;
+    if (agent == L"claude")
+        agentText = L"Claude";
+    else if (agent == L"opencode")
+        agentText = L"OpenCode";
+    else if (agent == L"agents")
+        agentText = L"Agents";
+    else
+        agentText = L"Codex";
+
+    std::wstring result = g_settings.petTemplate ? g_settings.petTemplate
+                                                 : L"{pet} {agent}: {state}";
+    ReplaceAll(result, L"{pet}", PetFrame(state));
+    ReplaceAll(result, L"{agent}", agentText);
+    ReplaceAll(result, L"{state}", stateText);
+
+    // Apply bridge placeholders so they can be used on the pet line too
+    result = ApplyBridgePlaceholders(result, data);
+
+    // Fallback: cleanup {usage} token if user has the old template
+    ReplaceAll(result, L" | {usage}", L"");
+    ReplaceAll(result, L"{usage}", L"");
+    return result;
+}
+
+std::wstring ResolveUsageLine(const std::wstring& data) {
     PCWSTR mode = Wh_GetStringSetting(L"Mode");
     bool usageMode = mode && _wcsicmp(mode, L"usage") == 0;
     Wh_FreeStringSetting(mode);
-    if (usageMode) {
-        std::wstring v = ReadUsageFile(UsageFilePath());
-        if (!v.empty())
-            return ApplyUsageTemplate(v);
-    }
-    return g_settings.text ? g_settings.text : L"";
+    std::wstring usage = g_settings.text ? g_settings.text : L"";
+    if (usageMode && !data.empty())
+        usage = ApplyUsageTemplate(data);
+    return usage;
+}
+
+void ResolveDisplayLines(std::wstring& line1, std::wstring& line2) {
+    std::wstring data = ReadUsageFile(UsageFilePath());
+    line1 = ResolvePetLine(data);
+    line2 = ResolveUsageLine(data);
 }
 
 std::wstring ExpandEnvironmentPath(PCWSTR value) {
@@ -361,6 +547,21 @@ void MaybeRunUpdater(bool force) {
     std::wstring command =
         L"\"" + powershell + L"\" -NoProfile -ExecutionPolicy Bypass -File \"" +
         script + L"\" -OutputFile \"" + UsageFilePath() + L"\"";
+    int usageRefreshSeconds = g_settings.usageRefreshSeconds > 0
+                                  ? g_settings.usageRefreshSeconds
+                                  : 60;
+    int workingThresholdSeconds = g_settings.workingThresholdSeconds > 0
+                                      ? g_settings.workingThresholdSeconds
+                                      : 15;
+    int blockedThresholdSeconds =
+        g_settings.blockedThresholdSeconds > workingThresholdSeconds
+            ? g_settings.blockedThresholdSeconds
+            : workingThresholdSeconds + 1;
+    command += L" -FullRefreshSeconds " + std::to_wstring(usageRefreshSeconds) +
+               L" -WorkingThresholdSeconds " +
+               std::to_wstring(workingThresholdSeconds) +
+               L" -BlockedThresholdSeconds " +
+               std::to_wstring(blockedThresholdSeconds);
     if (g_settings.updaterArguments && *g_settings.updaterArguments) {
         command += L" ";
         command += g_settings.updaterArguments;
@@ -408,7 +609,15 @@ void UpdateOverlay() {
     if (!g_hwndOverlay || !g_hTaskbar || !g_font)
         return;
 
-    std::wstring disp = ResolveDisplayText();
+    std::wstring line1, line2;
+    ResolveDisplayLines(line1, line2);
+
+    std::wstring lines[2];
+    int lineCount = 0;
+    if (!line1.empty())
+        lines[lineCount++] = line1;
+    if (!line2.empty())
+        lines[lineCount++] = line2;
 
     RECT rcT;
     if (!GetWindowRect(g_hTaskbar, &rcT))
@@ -418,25 +627,36 @@ void UpdateOverlay() {
         return;
 
     // Re-render only when the text or the taskbar rect actually changes.
+    std::wstring disp = line1 + L'\n' + line2;
     if (disp == g_lastText && memcmp(&rcT, &g_lastRect, sizeof(RECT)) == 0) {
         return;
     }
     g_lastText = disp;
     g_lastRect = rcT;
 
-    PCWSTR txt = disp.c_str();
-    int len = (int)disp.size();
-
     HDC screen = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(screen);
     HGDIOBJ oldFont = SelectObject(mem, g_font);
 
-    SIZE textSize = {0, 0};
-    if (len > 0)
-        GetTextExtentPoint32W(mem, txt, len, &textSize);
+    SIZE sizes[2] = {{0, 0}, {0, 0}};
+    int maxWidth = 0;
+    for (int i = 0; i < lineCount; i++) {
+        if (!lines[i].empty())
+            GetTextExtentPoint32W(mem, lines[i].c_str(), (int)lines[i].size(),
+                                  &sizes[i]);
+        if (sizes[i].cx > maxWidth)
+            maxWidth = sizes[i].cx;
+    }
+
+    TEXTMETRICW tm;
+    if (!GetTextMetricsW(mem, &tm))
+        memset(&tm, 0, sizeof(tm));
+    int lineH = tm.tmHeight > 0
+                    ? tm.tmHeight
+                    : (sizes[0].cy > 0 ? sizes[0].cy : g_settings.fontSize);
 
     const int padX = 8;
-    int overlayW = (len > 0 ? textSize.cx : 0) + padX * 2;
+    int overlayW = maxWidth + padX * 2;
     int overlayH = barH;
     if (overlayW < 4)
         overlayW = 4;
@@ -463,8 +683,17 @@ void UpdateOverlay() {
 
     SetTextColor(mem, RGB(255, 255, 255));
     SetBkMode(mem, TRANSPARENT);
-    RECT rcText = {padX, 0, overlayW, overlayH};
-    DrawTextW(mem, txt, len, &rcText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    int blockH = lineCount * lineH;
+    int startY = (overlayH - blockH) / 2;
+    for (int i = 0; i < lineCount; i++) {
+        RECT rcLine;
+        rcLine.left = padX;
+        rcLine.right = overlayW;
+        rcLine.top = startY + i * lineH;
+        rcLine.bottom = startY + (i + 1) * lineH;
+        DrawTextW(mem, lines[i].c_str(), (int)lines[i].size(), &rcLine,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    }
 
     BYTE tr = GetRValue(g_settings.color);
     BYTE tg = GetGValue(g_settings.color);
@@ -498,8 +727,6 @@ void UpdateOverlay() {
     ReleaseDC(nullptr, screen);
 
     ShowWindow(g_hwndOverlay, SW_SHOWNOACTIVATE);
-    Wh_Log(L"UpdateOverlay: pos=%d,%d size=%dx%d barH=%d", ptPos.x, ptPos.y,
-           overlayW, overlayH, barH);
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hWnd,
@@ -542,7 +769,7 @@ void CreateOverlay() {
     Wh_Log(L"CreateWindowEx overlay -> %p (err=%lu)", g_hwndOverlay,
            GetLastError());
     if (g_hwndOverlay) {
-        SetTimer(g_hwndOverlay, TIMER_ID, 1000, nullptr);
+        SetTimer(g_hwndOverlay, TIMER_ID, OverlayTimerInterval(), nullptr);
         MaybeRunUpdater(true);
         UpdateOverlay();
     }
@@ -568,6 +795,11 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
         case WM_TBLT_APPLY:
             CreateOverlayFont();
             g_lastText.clear();  // force re-render even if text is unchanged
+            if (g_hwndOverlay) {
+                KillTimer(g_hwndOverlay, TIMER_ID);
+                SetTimer(g_hwndOverlay, TIMER_ID, OverlayTimerInterval(),
+                         nullptr);
+            }
             g_nextUpdateTick = 0;
             MaybeRunUpdater(true);
             UpdateOverlay();

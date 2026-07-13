@@ -12,6 +12,8 @@ user-configurable template.
 ## Features
 
 - Native Windows 11 taskbar overlay with per-pixel alpha rendering.
+- Animated ASCII cat with working, idle, and blocked states.
+- Selectable Codex, Claude Code, OpenCode, or aggregate agent tracking.
 - Claude Code 5-hour block and weekly estimates.
 - Claude Code, Codex, and OpenCode daily, monthly, and latest-session reports.
 - Template-based display similar to a configurable clock extension.
@@ -114,7 +116,15 @@ Update `UpdaterScript` if the repository is moved.
 | `UpdaterScript` | Repository script path | Path to `Update-TaskbarUsage.ps1`. Environment variables are expanded. |
 | `UpdaterArguments` | Empty | Optional PowerShell arguments, including estimated limit overrides. |
 | `RefreshSeconds` | `5` | Minimum delay between updater launches. |
+| `UsageRefreshSeconds` | `60` | Expensive ccusage report refresh interval. State checks still run every `RefreshSeconds`. |
 | `Template` | Compact usage label | Controls the rendered text using placeholders. |
+| `PetEnabled` | `true` | Enables the animated ASCII pet. |
+| `PetAgent` | `codex` | Selects `codex`, `claude`, `opencode`, or aggregate `agents`. |
+| `PetTemplate` | `{pet} {agent}: {state} \| {usage}` | Composes pet animation, state text, and usage label. |
+| `PetAnimationMs` | `500` | Milliseconds per animation frame. Clamped to 100-5000 ms. |
+| `PetStateOverride` | `auto` | Forces `working`, `idle`, or `blocked` for testing. |
+| `WorkingThresholdSeconds` | `15` | Recent progress window classified as working. |
+| `BlockedThresholdSeconds` | `60` | Running process inactivity classified as blocked. |
 | `Text` | `★ Taskbar` | Static-mode text and fallback when usage data is unavailable. |
 | `OffsetX` | `12` | Horizontal offset from the left edge of the primary taskbar. |
 | `FontSize` | `13` | Segoe UI font size. |
@@ -123,6 +133,46 @@ Update `UpdaterScript` if the repository is moved.
 The updater is asynchronous. Explorer never waits for ccusage to finish. If an
 update takes longer than five seconds, another updater is not started until the
 current process exits.
+
+## Pet States
+
+The animated pet is driven by the agent selected in `PetAgent`.
+
+| State | Default frames | Detection |
+|---|---|---|
+| Working | `(=^.^=)>` and `(=^o^=)>` | Recent session activity or increased process CPU time within `WorkingThresholdSeconds`. |
+| Idle | `(=-.-=)z` and `(=-.-=)Z` | Agent is stopped, or running without recent progress but below the blocked threshold. |
+| Blocked | `(=x.x=)!` and `(=o.o=)?` | Agent process is still running without detected progress for `BlockedThresholdSeconds`. |
+
+The detector does not inspect prompts or conversation text. It identifies agent
+processes and compares process CPU time and latest ccusage session activity with
+the prior five-second bridge update.
+
+For `PetAgent: agents`, aggregate priority is:
+
+```text
+blocked > working > idle
+```
+
+The bridge also exports `activeAgent`, which identifies the most recently
+active agent in the aggregate state.
+
+Use `PetStateOverride` to preview each animation without starting an agent:
+
+```text
+working
+idle
+blocked
+```
+
+The default pet composition is:
+
+```text
+{pet} {agent}: {state} | {usage}
+```
+
+`PetTemplate` supports `{pet}`, `{agent}`, `{state}`, and `{usage}`. The
+`{usage}` value is the result of the regular usage `Template` setting.
 
 ## Usage Estimates
 
@@ -179,6 +229,27 @@ C5 {claudeBlockPct}% | CW {claudeWeeklyPct}% | X {codexWeeklyPct}% | O {opencode
 | `{opencodeWeeklyCost}` | OpenCode current-week cost. |
 | `{updatedAt}` | Bridge update time in `HH:mm` format. |
 
+### State Fields
+
+Each agent exports these bridge placeholders:
+
+```text
+{codexState}
+{codexStateText}
+{codexProcessRunning}
+{codexActivityAgeSeconds}
+```
+
+Replace `codex` with `claude` or `opencode`. Aggregate fields are:
+
+```text
+{agentsState}
+{agentsStateText}
+{activeAgent}
+{agentsWorkingCount}
+{agentsBlockedCount}
+```
+
 ### Report Fields
 
 Daily, monthly, and latest-session values use this naming convention:
@@ -218,6 +289,7 @@ Fields:
 | `Models` | Comma-separated model names. |
 | `ModelBreakdowns` | Comma-separated `model:cost` values. |
 | `LastActivity` | Latest session activity in local time. |
+| `LastActivityAgo` | Relative time since last activity, e.g. `5m ago`, `2h ago`. Refreshes every run. |
 
 If an agent has no activity today, its daily fields contain zeroes and `-`
 placeholders. Monthly fields describe the current month. Session fields describe
@@ -314,8 +386,13 @@ The mod:
 - Finds and subclasses `Shell_TrayWnd` in `explorer.exe`.
 - Creates a layered, click-through popup owned by the taskbar.
 - Draws premultiplied alpha text over the Windows 11 XAML taskbar.
-- Reads the bridge every second and redraws only when text or taskbar position changes.
+- Animates locally at `PetAnimationMs` without launching external processes per frame.
+- Reads the bridge on the animation timer and redraws only when the frame, text,
+  or taskbar position changes.
 - Starts hidden PowerShell asynchronously according to `RefreshSeconds`.
+- Runs lightweight state detection every five seconds and caches expensive
+  ccusage aggregation for `UsageRefreshSeconds`.
+- Writes bridge updates atomically so the overlay never reads a partial file.
 - Tracks the updater process handle and prevents overlapping launches.
 - Destroys its window and removes the subclass on unload.
 
@@ -341,7 +418,7 @@ The mod:
 
 ### No Text Appears
 
-- Confirm the Windhawk log says `Initializing ... v0.6.1` or newer.
+- Confirm the Windhawk log says `Initializing ... v0.7` or newer.
 - Confirm `AfterInit: taskbar hwnd=...` and `CreateWindowEx overlay -> ...` appear.
 - Restart Windows Explorer after enabling the mod.
 - Try `Mode: text` to verify rendering independently of ccusage.
@@ -373,11 +450,20 @@ npm install --global ccusage
 - The updater only reports data found in local agent logs.
 - Use `-ShowRaw` when running the updater to inspect ccusage JSON.
 
+### Pet State Looks Wrong
+
+- Set `PetStateOverride` to confirm the expected animation renders.
+- Check `{codexProcessRunning}` or the matching agent key in the bridge file.
+- Increase `WorkingThresholdSeconds` for agents with long network waits.
+- Increase `BlockedThresholdSeconds` if waiting at an interactive prompt should
+  remain idle longer.
+- Blocked is a no-progress heuristic, not an interpretation of agent output.
+
 ### Updates Are Slower Than Five Seconds
 
-ccusage may take longer than five seconds, especially when invoked through
-`npx`. The mod intentionally prevents overlapping processes. Therefore, the
-effective refresh interval is at least the updater's execution time.
+PowerShell state checks run every five seconds, but a full ccusage report is
+cached for 60 seconds by default. If an updater process takes longer than five
+seconds, overlap protection delays the next state check until it exits.
 
 ### Windhawk Reports YAML Errors
 
@@ -414,5 +500,7 @@ Useful references:
 - Daily/monthly/session values are based on local logs and ccusage pricing.
 - Very long templates can overlap taskbar controls.
 - Automatic refresh depends on the configured PowerShell script path.
+- Working/idle/blocked states are process/activity heuristics and cannot know an
+  agent's semantic intent.
 - Closing the updater process handle on mod unload does not terminate an updater
   that was already launched; it may finish writing the bridge file normally.
