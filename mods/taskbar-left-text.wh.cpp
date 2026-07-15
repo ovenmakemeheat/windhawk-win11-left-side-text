@@ -2,7 +2,7 @@
 // @id              taskbar-left-text
 // @name            Taskbar Left Text
 // @description     Shows custom text on the left side of the taskbar
-// @version         0.7.2
+// @version         0.7.3
 // @author          ovenmakemeheat
 // @github          https://github.com/ovenmakemeheat/windhawk-taskbar-ai-usage
 // @include         explorer.exe
@@ -158,6 +158,7 @@ HFONT g_font = nullptr;
 bool g_classRegistered = false;
 HANDLE g_updaterProcess = nullptr;
 ULONGLONG g_nextUpdateTick = 0;
+HWINEVENTHOOK g_winEventHook = nullptr;
 
 std::wstring g_lastText;
 RECT g_lastRect = {};
@@ -756,6 +757,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd,
     return DefWindowProcW(hWnd, uMsg, wParam, lParam);
 }
 
+void CALLBACK
+    TaskbarWinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
+
 void CreateOverlay() {
     if (g_hwndOverlay && IsWindow(g_hwndOverlay)) {
         UpdateOverlay();
@@ -773,6 +777,27 @@ void CreateOverlay() {
         MaybeRunUpdater(true);
         UpdateOverlay();
     }
+
+    // Track taskbar movement (resize, auto-hide slide, DPI change, monitor
+    // reconnect) so the overlay sticks to the taskbar in real time.
+    if (!g_winEventHook) {
+        g_winEventHook = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+            TaskbarWinEventProc, GetCurrentProcessId(), 0,
+            WINEVENT_OUTOFCONTEXT);
+    }
+}
+
+void CALLBACK TaskbarWinEventProc(HWINEVENTHOOK,
+                                  DWORD,
+                                  HWND hwnd,
+                                  LONG idObject,
+                                  LONG,
+                                  DWORD,
+                                  DWORD) {
+    if (!hwnd || hwnd != g_hTaskbar || idObject != OBJID_WINDOW)
+        return;
+    UpdateOverlay();
 }
 
 LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
@@ -806,6 +831,10 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
             return 0;
 
         case WM_TBLT_DESTROY:
+            if (g_winEventHook) {
+                UnhookWinEvent(g_winEventHook);
+                g_winEventHook = nullptr;
+            }
             if (g_hwndOverlay && IsWindow(g_hwndOverlay)) {
                 KillTimer(g_hwndOverlay, TIMER_ID);
                 DestroyWindow(g_hwndOverlay);
